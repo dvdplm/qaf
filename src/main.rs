@@ -5,7 +5,8 @@ use objc2::runtime::ProtocolObject;
 use objc2::{DeclaredClass, MainThreadOnly, Message, define_class};
 use objc2::{MainThreadMarker, msg_send};
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSStatusBar, NSStatusItem,
+    NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSMenu, NSMenuItem,
+    NSStatusBar, NSStatusItem,
 };
 use objc2_foundation::{NSObject, NSObjectProtocol, NSString};
 use tracing::info;
@@ -14,6 +15,7 @@ use tracing::info;
 #[derive(Debug)]
 struct AppDelegateIvars {
     status_item: std::cell::OnceCell<Retained<NSStatusItem>>,
+    menu: std::cell::OnceCell<Retained<NSMenu>>,
 }
 
 // Create our app delegate class
@@ -33,13 +35,63 @@ define_class!(
         fn did_finish_launching(&self, _notification: &NSObject) {
             info!("Application did finish launching");
 
+            let mtm = MainThreadMarker::from(self);
+
             // Get the system status bar
             let status_bar = unsafe { NSStatusBar::systemStatusBar() };
 
             // Create a status item with variable length (-1.0 for variable length)
             let status_item = unsafe { status_bar.statusItemWithLength(-1.0) };
 
-            let mtm = MainThreadMarker::from(self);
+            // Create the menu
+            let menu = NSMenu::new(mtm);
+
+            // Create menu items
+            let usb_item = unsafe {
+                NSMenuItem::initWithTitle_action_keyEquivalent(
+                    NSMenuItem::alloc(mtm),
+                    &NSString::from_str("USB"),
+                    Some(objc2::sel!(menuItemClicked:)),
+                    &NSString::from_str(""),
+                )
+            };
+            unsafe { usb_item.setTarget(Some(&self.retain())) };
+
+            let wifi_item = unsafe {
+                NSMenuItem::initWithTitle_action_keyEquivalent(
+                    NSMenuItem::alloc(mtm),
+                    &NSString::from_str("WiFi"),
+                    Some(objc2::sel!(menuItemClicked:)),
+                    &NSString::from_str(""),
+                )
+            };
+            unsafe { wifi_item.setTarget(Some(&self.retain())) };
+
+            let bluetooth_item = unsafe {
+                NSMenuItem::initWithTitle_action_keyEquivalent(
+                    NSMenuItem::alloc(mtm),
+                    &NSString::from_str("Bluetooth"),
+                    Some(objc2::sel!(menuItemClicked:)),
+                    &NSString::from_str(""),
+                )
+            };
+            unsafe { bluetooth_item.setTarget(Some(&self.retain())) };
+
+            let optical_item = unsafe {
+                NSMenuItem::initWithTitle_action_keyEquivalent(
+                    NSMenuItem::alloc(mtm),
+                    &NSString::from_str("Optical"),
+                    Some(objc2::sel!(menuItemClicked:)),
+                    &NSString::from_str(""),
+                )
+            };
+            unsafe { optical_item.setTarget(Some(&self.retain())) };
+
+            // Add items to menu
+            menu.addItem(&usb_item);
+            menu.addItem(&wifi_item);
+            menu.addItem(&bluetooth_item);
+            menu.addItem(&optical_item);
             // Set the title text for now (we'll use an icon later)
             let title = NSString::from_str("qaf");
             unsafe {
@@ -47,23 +99,26 @@ define_class!(
                     .button(mtm)
                     .expect("Status item should have a button");
                 button.setTitle(&title);
-
-                // Set the button action
-                button.setTarget(Some(&self.retain()));
-                button.setAction(Some(objc2::sel!(statusItemClicked:)));
             }
 
-            // Store the status item in our ivars so it doesn't get deallocated
+            // Set the menu on the status item - it will show automatically on click
+            unsafe {
+                status_item.setMenu(Some(&menu));
+            }
+
+            // Store the status item and menu in our ivars so they don't get deallocated
             self.ivars().status_item.set(status_item).ok();
+            self.ivars().menu.set(menu).ok();
 
             info!("Status bar item created");
         }
 
     }
     impl AppDelegate {
-        #[unsafe(method(statusItemClicked:))]
-        fn status_item_clicked(&self, _sender: &NSObject) {
-            info!("clicked");
+        #[unsafe(method(menuItemClicked:))]
+        fn menu_item_clicked(&self, sender: &NSMenuItem) {
+            let title = unsafe { sender.title() };
+            info!("Menu item clicked: {}", title);
         }
     }
 );
@@ -73,6 +128,7 @@ impl AppDelegate {
         let this = Self::alloc(mtm);
         let this = this.set_ivars(AppDelegateIvars {
             status_item: std::cell::OnceCell::new(),
+            menu: std::cell::OnceCell::new(),
         });
         unsafe { msg_send![super(this), init] }
     }
