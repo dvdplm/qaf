@@ -11,16 +11,115 @@ use objc2_app_kit::{
 use objc2_foundation::{NSObject, NSObjectProtocol, NSString};
 use tracing::info;
 
+// Channel for communication between UI and speaker controller
+use tokio::sync::mpsc;
+
+// Speaker control commands
+#[derive(Debug, Clone)]
+pub enum SpeakerCommand {
+    SetInput(InputSource),
+    GetStatus,
+    PowerOn,
+    PowerOff,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum InputSource {
+    USB,
+    WiFi,
+    Bluetooth,
+    Optical,
+}
+
+impl InputSource {
+    fn as_str(&self) -> &'static str {
+        match self {
+            InputSource::USB => "USB",
+            InputSource::WiFi => "WiFi",
+            InputSource::Bluetooth => "Bluetooth",
+            InputSource::Optical => "Optical",
+        }
+    }
+
+    fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "USB" => Some(InputSource::USB),
+            "WiFi" => Some(InputSource::WiFi),
+            "Bluetooth" => Some(InputSource::Bluetooth),
+            "Optical" => Some(InputSource::Optical),
+            _ => None,
+        }
+    }
+}
+
+mod speaker {
+    use super::*;
+    use tracing::info;
+
+    pub struct SpeakerController {
+        rx: mpsc::UnboundedReceiver<SpeakerCommand>,
+        // Add your speaker API endpoint here
+        // base_url: String,
+    }
+
+    impl SpeakerController {
+        pub fn new(rx: mpsc::UnboundedReceiver<SpeakerCommand>) -> Self {
+            Self {
+                rx,
+                // base_url: "http://speaker.local".to_string(),
+            }
+        }
+
+        pub async fn run(mut self) {
+            info!("Speaker controller started");
+
+            while let Some(command) = self.rx.recv().await {
+                match command {
+                    SpeakerCommand::SetInput(input) => {
+                        info!("Setting input to: {:?}", input);
+                        // TODO: Make actual HTTP request
+                        // Example:
+                        // let client = reqwest::Client::new();
+                        // let res = client.post(&format!("{}/input", self.base_url))
+                        //     .json(&json!({ "source": input.as_str() }))
+                        //     .send()
+                        //     .await;
+                    }
+                    SpeakerCommand::GetStatus => {
+                        info!("Getting speaker status");
+                        // TODO: Make actual HTTP request
+                    }
+                    SpeakerCommand::PowerOn => {
+                        info!("Powering on speakers");
+                        // TODO: Make actual HTTP request
+                    }
+                    SpeakerCommand::PowerOff => {
+                        info!("Powering off speakers");
+                        // TODO: Make actual HTTP request
+                    }
+                }
+            }
+
+            info!("Speaker controller shutting down");
+        }
+    }
+}
+
 mod menubar {
     use super::*;
     use std::cell::{OnceCell, RefCell};
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    // Store the sender globally so we can access it from the menu callbacks
+    static SPEAKER_TX: OnceLock<Arc<Mutex<mpsc::UnboundedSender<SpeakerCommand>>>> =
+        OnceLock::new();
 
     // Ivars to store our app state
     #[derive(Debug)]
     pub struct AppDelegateIvars {
         status_item: OnceCell<Retained<NSStatusItem>>,
         menu: OnceCell<Retained<NSMenu>>,
-        current_input: RefCell<String>,
+        current_input: RefCell<InputSource>,
     }
 
     // Create our app delegate class
@@ -51,8 +150,8 @@ mod menubar {
                 // Create the menu
                 let menu = NSMenu::new(mtm);
 
-                // Get the current input selection (default to USB)
-                let current = self.ivars().current_input.borrow();
+                // Get the current input selection
+                let current = *self.ivars().current_input.borrow();
 
                 // Create menu items
                 let usb_item = unsafe {
@@ -66,7 +165,7 @@ mod menubar {
                 unsafe {
                     usb_item.setTarget(Some(&self.retain()));
                     usb_item.setTag(1);
-                    if *current == "USB" {
+                    if current == InputSource::USB {
                         let _: () = msg_send![&usb_item, setState: 1i64];
                     }
                 }
@@ -82,7 +181,7 @@ mod menubar {
                 unsafe {
                     wifi_item.setTarget(Some(&self.retain()));
                     wifi_item.setTag(2);
-                    if *current == "WiFi" {
+                    if current == InputSource::WiFi {
                         let _: () = msg_send![&wifi_item, setState: 1i64];
                     }
                 }
@@ -98,7 +197,7 @@ mod menubar {
                 unsafe {
                     bluetooth_item.setTarget(Some(&self.retain()));
                     bluetooth_item.setTag(3);
-                    if *current == "Bluetooth" {
+                    if current == InputSource::Bluetooth {
                         let _: () = msg_send![&bluetooth_item, setState: 1i64];
                     }
                 }
@@ -114,7 +213,7 @@ mod menubar {
                 unsafe {
                     optical_item.setTarget(Some(&self.retain()));
                     optical_item.setTag(4);
-                    if *current == "Optical" {
+                    if current == InputSource::Optical {
                         let _: () = msg_send![&optical_item, setState: 1i64];
                     }
                 }
@@ -169,44 +268,33 @@ mod menubar {
                 let title = unsafe { sender.title() };
                 info!("Menu item clicked: {}", title);
 
-                // Update the current input
-                *self.ivars().current_input.borrow_mut() = title.to_string();
+                // Parse the input source
+                if let Some(input) = InputSource::from_str(&title.to_string()) {
+                    // Update the current input
+                    *self.ivars().current_input.borrow_mut() = input;
 
-                // Update the menu item states
-                if let Some(menu) = self.ivars().menu.get() {
-                    let item_count = unsafe { menu.numberOfItems() };
-                    for i in 0..item_count {
-                        if let Some(item) = unsafe { menu.itemAtIndex(i) } {
-                            unsafe {
-                                if item.title().to_string() == title.to_string() {
-                                    let _: () = msg_send![&item, setState: 1i64];
-                                } else {
-                                    let _: () = msg_send![&item, setState: 0i64];
+                    // Update the menu item states
+                    if let Some(menu) = self.ivars().menu.get() {
+                        let item_count = unsafe { menu.numberOfItems() };
+                        for i in 0..item_count {
+                            if let Some(item) = unsafe { menu.itemAtIndex(i) } {
+                                unsafe {
+                                    if item.title().to_string() == title.to_string() {
+                                        let _: () = msg_send![&item, setState: 1i64];
+                                    } else {
+                                        let _: () = msg_send![&item, setState: 0i64];
+                                    }
                                 }
                             }
                         }
                     }
-                }
 
-                // TODO: Call speaker control functions here
-                match title.to_string().as_str() {
-                    "USB" => {
-                        info!("TODO: Switch speaker to USB input");
-                        // speaker::set_input(speaker::Input::USB);
+                    // Send command to speaker controller
+                    if let Some(tx) = SPEAKER_TX.get() {
+                        if let Ok(tx) = tx.lock() {
+                            let _ = tx.send(SpeakerCommand::SetInput(input));
+                        }
                     }
-                    "WiFi" => {
-                        info!("TODO: Switch speaker to WiFi input");
-                        // speaker::set_input(speaker::Input::WiFi);
-                    }
-                    "Bluetooth" => {
-                        info!("TODO: Switch speaker to Bluetooth input");
-                        // speaker::set_input(speaker::Input::Bluetooth);
-                    }
-                    "Optical" => {
-                        info!("TODO: Switch speaker to Optical input");
-                        // speaker::set_input(speaker::Input::Optical);
-                    }
-                    _ => {}
                 }
             }
 
@@ -227,13 +315,16 @@ mod menubar {
             let this = this.set_ivars(AppDelegateIvars {
                 status_item: OnceCell::new(),
                 menu: OnceCell::new(),
-                current_input: RefCell::new("USB".to_string()),
+                current_input: RefCell::new(InputSource::USB),
             });
             unsafe { msg_send![super(this), init] }
         }
     }
 
-    pub fn run() {
+    pub fn run(tx: mpsc::UnboundedSender<SpeakerCommand>) {
+        // Store the sender for use in menu callbacks
+        let _ = SPEAKER_TX.set(Arc::new(Mutex::new(tx)));
+
         // Initialize tracing
         tracing_subscriber::fmt()
             .with_env_filter(
@@ -266,5 +357,18 @@ mod menubar {
 }
 
 fn main() {
-    menubar::run();
+    // Create channel for communication
+    let (tx, rx) = mpsc::unbounded_channel::<SpeakerCommand>();
+
+    // Spawn the async runtime in a separate thread
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
+        runtime.block_on(async {
+            let controller = speaker::SpeakerController::new(rx);
+            controller.run().await;
+        });
+    });
+
+    // Run the UI on the main thread
+    menubar::run(tx);
 }
