@@ -1,0 +1,41 @@
+[package]
+name = "qaf"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+objc2 = "0.6.2"
+block2 = "0.5.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+objc2-foundation = { version = "0.3.1", default-features = false, features = [
+    "std",
+    "NSNotification",
+    "NSString",
+    "NSObject",
+    "NSThread",
+    "NSData",
+    "NSDate",
+    "NSRunLoop",
+    "NSTimer",
+
+] }
+objc2-app-kit = { version = "0.3.1", default-features = false, features = [
+    "std","objc2-core-foundation",
+    "NSResponder",
+    "NSApplication",
+    "NSRunningApplication",
+    "NSGraphics",
+    "NSWindow",
+    "NSView",
+    "NSWorkspace",
+    "NSStatusBar",
+    "NSStatusBarButton",
+    "NSStatusItem",
+    "NSMenu",
+    "NSMenuItem",
+    "NSEvent",
+    "NSImage",
+    "NSControl",
+    "NSButton"
+] }
