@@ -16,6 +16,7 @@ use tracing::info;
 struct AppDelegateIvars {
     status_item: std::cell::OnceCell<Retained<NSStatusItem>>,
     menu: std::cell::OnceCell<Retained<NSMenu>>,
+    current_input: std::cell::RefCell<String>,
 }
 
 // Create our app delegate class
@@ -46,6 +47,9 @@ define_class!(
             // Create the menu
             let menu = NSMenu::new(mtm);
 
+            // Get the current input selection (default to USB)
+            let current = self.ivars().current_input.borrow();
+
             // Create menu items
             let usb_item = unsafe {
                 NSMenuItem::initWithTitle_action_keyEquivalent(
@@ -55,7 +59,13 @@ define_class!(
                     &NSString::from_str(""),
                 )
             };
-            unsafe { usb_item.setTarget(Some(&self.retain())) };
+            unsafe {
+                usb_item.setTarget(Some(&self.retain()));
+                usb_item.setTag(1);
+                if *current == "USB" {
+                    let _: () = msg_send![&usb_item, setState: 1i64];
+                }
+            }
 
             let wifi_item = unsafe {
                 NSMenuItem::initWithTitle_action_keyEquivalent(
@@ -65,7 +75,13 @@ define_class!(
                     &NSString::from_str(""),
                 )
             };
-            unsafe { wifi_item.setTarget(Some(&self.retain())) };
+            unsafe {
+                wifi_item.setTarget(Some(&self.retain()));
+                wifi_item.setTag(2);
+                if *current == "WiFi" {
+                    let _: () = msg_send![&wifi_item, setState: 1i64];
+                }
+            }
 
             let bluetooth_item = unsafe {
                 NSMenuItem::initWithTitle_action_keyEquivalent(
@@ -75,7 +91,13 @@ define_class!(
                     &NSString::from_str(""),
                 )
             };
-            unsafe { bluetooth_item.setTarget(Some(&self.retain())) };
+            unsafe {
+                bluetooth_item.setTarget(Some(&self.retain()));
+                bluetooth_item.setTag(3);
+                if *current == "Bluetooth" {
+                    let _: () = msg_send![&bluetooth_item, setState: 1i64];
+                }
+            }
 
             let optical_item = unsafe {
                 NSMenuItem::initWithTitle_action_keyEquivalent(
@@ -85,13 +107,35 @@ define_class!(
                     &NSString::from_str(""),
                 )
             };
-            unsafe { optical_item.setTarget(Some(&self.retain())) };
+            unsafe {
+                optical_item.setTarget(Some(&self.retain()));
+                optical_item.setTag(4);
+                if *current == "Optical" {
+                    let _: () = msg_send![&optical_item, setState: 1i64];
+                }
+            }
 
             // Add items to menu
             menu.addItem(&usb_item);
             menu.addItem(&wifi_item);
             menu.addItem(&bluetooth_item);
             menu.addItem(&optical_item);
+
+            // Add separator
+            let separator = NSMenuItem::separatorItem(mtm);
+            menu.addItem(&separator);
+
+            // Add quit item
+            let quit_item = unsafe {
+                NSMenuItem::initWithTitle_action_keyEquivalent(
+                    NSMenuItem::alloc(mtm),
+                    &NSString::from_str("Quit"),
+                    Some(objc2::sel!(quitClicked:)),
+                    &NSString::from_str(""),
+                )
+            };
+            unsafe { quit_item.setTarget(Some(&self.retain())) };
+            menu.addItem(&quit_item);
             // Set the title text for now (we'll use an icon later)
             let title = NSString::from_str("qaf");
             unsafe {
@@ -119,6 +163,34 @@ define_class!(
         fn menu_item_clicked(&self, sender: &NSMenuItem) {
             let title = unsafe { sender.title() };
             info!("Menu item clicked: {}", title);
+
+            // Update the current input
+            *self.ivars().current_input.borrow_mut() = title.to_string();
+
+            // Update the menu item states
+            if let Some(menu) = self.ivars().menu.get() {
+                let item_count = unsafe { menu.numberOfItems() };
+                for i in 0..item_count {
+                    if let Some(item) = unsafe { menu.itemAtIndex(i) } {
+                        unsafe {
+                            if item.title().to_string() == title.to_string() {
+                                let _: () = msg_send![&item, setState: 1i64];
+                            } else {
+                                let _: () = msg_send![&item, setState: 0i64];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        #[unsafe(method(quitClicked:))]
+        fn quit_clicked(&self, _sender: &NSMenuItem) {
+            info!("Quit clicked - exiting application");
+            let app = NSApplication::sharedApplication(MainThreadMarker::from(self));
+            unsafe {
+                app.terminate(None);
+            }
         }
     }
 );
@@ -129,6 +201,7 @@ impl AppDelegate {
         let this = this.set_ivars(AppDelegateIvars {
             status_item: std::cell::OnceCell::new(),
             menu: std::cell::OnceCell::new(),
+            current_input: std::cell::RefCell::new("USB".to_string()),
         });
         unsafe { msg_send![super(this), init] }
     }
