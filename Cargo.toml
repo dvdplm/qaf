@@ -11,6 +11,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.11", features = ["json"] }
 serde_json = "1.0"
+mdns-sd = "0.11"
 objc2-foundation = { version = "0.3.1", default-features = false, features = [
     "std",
     "NSNotification",
