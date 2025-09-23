@@ -1,6 +1,7 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
@@ -34,6 +35,7 @@ pub struct SpeakerInfo {
     pub port: u16,
     pub name: String,
     pub model: String,
+    pub base_url: String,
 }
 
 #[derive(Debug, Clone)]
@@ -85,6 +87,7 @@ mod speaker {
     use super::*;
     use mdns_sd::{ServiceDaemon, ServiceEvent};
     use serde_json::json;
+    use tracing::{trace, warn};
 
     pub struct SpeakerController {
         rx: mpsc::UnboundedReceiver<SpeakerCommand>,
@@ -100,84 +103,77 @@ mod speaker {
                 client: reqwest::Client::new(),
             }
         }
+        pub fn discover_speaker() -> Option<SpeakerInfo> {
+            debug!("Starting mDNS discovery for KEF speakers…");
+            let service_type = "_kef-info._tcp.local.";
+            let mdns = match ServiceDaemon::new() {
+                Ok(daemon) => daemon,
+                Err(e) => {
+                    error!("Failed to create mDNS daemon: {}", e);
+                    return None;
+                }
+            };
 
-        pub async fn discover_speakers(tx: mpsc::UnboundedSender<SpeakerCommand>) {
-            tokio::task::spawn_blocking(move || {
-                info!("Starting mDNS discovery for KEF speakers...");
+            let receiver = match mdns.browse(service_type) {
+                Ok(r) => r,
+                Err(e) => {
+                    error!("Failed to browse for KEF speakers: {}", e);
+                    return None;
+                }
+            };
+            debug!("Searching for KEF speakers on the network...");
+            let mut speaker_info = None;
+            while let Ok(event) = receiver.recv() {
+                if let ServiceEvent::ServiceResolved(info) = event {
+                    trace!("Found KEF speaker: {}", info.get_fullname());
 
-                let service_type = "_kef-info._tcp.local.";
-                let mdns = match ServiceDaemon::new() {
-                    Ok(daemon) => daemon,
-                    Err(e) => {
-                        error!("Failed to create mDNS daemon: {}", e);
-                        return;
-                    }
-                };
+                    // Get the first IPv4 address
+                    if let Some(addr) = info.get_addresses().iter().find(|a| a.is_ipv4()) {
+                        let port = info.get_port();
+                        let name = info
+                            .get_property("name")
+                            .map(|p| p.val_str().to_string())
+                            .unwrap_or_else(|| "Unknown KEF Speaker".to_string());
+                        let model = info
+                            .get_property("modelName")
+                            .map(|p| p.val_str().to_string())
+                            .unwrap_or_else(|| "Unknown Model".to_string());
 
-                let receiver = match mdns.browse(service_type) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        error!("Failed to browse for KEF speakers: {}", e);
-                        return;
-                    }
-                };
+                        trace!(
+                            "KEF Speaker discovered - Name: {}, Model: {}, Address: {}:{}",
+                            name, model, addr, port
+                        );
+                        let address = addr.to_string();
+                        speaker_info = Some(SpeakerInfo {
+                            address,
+                            port,
+                            name,
+                            model,
+                            base_url: format!("http://{}:{}", addr.to_string(), port),
+                        });
 
-                info!("Searching for KEF speakers on the network...");
+                        // Stop mDNS discovery by calling shutdown
+                        trace!("Stopping mDNS discovery after finding first speaker");
+                        drop(receiver);
 
-                while let Ok(event) = receiver.recv() {
-                    if let ServiceEvent::ServiceResolved(info) = event {
-                        info!("Found KEF speaker: {}", info.get_fullname());
-
-                        // Get the first IPv4 address
-                        if let Some(addr) = info.get_addresses().iter().find(|a| a.is_ipv4()) {
-                            let port = info.get_port();
-                            let name = info
-                                .get_property("name")
-                                .map(|p| p.val_str().to_string())
-                                .unwrap_or_else(|| "Unknown KEF Speaker".to_string());
-                            let model = info
-                                .get_property("modelName")
-                                .map(|p| p.val_str().to_string())
-                                .unwrap_or_else(|| "Unknown Model".to_string());
-
-                            info!(
-                                "KEF Speaker discovered - Name: {}, Model: {}, Address: {}:{}",
-                                name, model, addr, port
-                            );
-
-                            let speaker_info = SpeakerInfo {
-                                address: addr.to_string(),
-                                port,
-                                name,
-                                model,
-                            };
-
-                            let _ = tx.send(SpeakerCommand::SpeakerDiscovered(speaker_info));
-
-                            // Stop mDNS discovery by calling shutdown
-                            info!("Stopping mDNS discovery after finding first speaker");
-                            drop(receiver);
-
-                            match mdns.shutdown() {
-                                Ok(shutdown_rx) => {
-                                    // Wait for shutdown confirmation
-                                    if let Ok(_) = shutdown_rx.recv() {
-                                        info!("mDNS daemon shutdown successfully");
-                                    } else {
-                                        error!("Failed to receive mDNS shutdown confirmation");
-                                    }
-                                }
-                                Err(e) => {
-                                    error!("Failed to shutdown mDNS daemon: {}", e);
+                        match mdns.shutdown() {
+                            Ok(shutdown_rx) => {
+                                // Wait for shutdown confirmation
+                                if let Ok(_) = shutdown_rx.recv() {
+                                    trace!("mDNS daemon shutdown successfully");
+                                } else {
+                                    warn!("Failed to receive mDNS shutdown confirmation");
                                 }
                             }
-                            return;
+                            Err(e) => {
+                                warn!("Failed to shutdown mDNS daemon: {}", e);
+                            }
                         }
+                        break;
                     }
                 }
-
-                info!("mDNS discovery thread exiting (no more events)");
-            });
+            }
+            return speaker_info;
         }
 
         pub async fn run(mut self) {
@@ -424,7 +420,7 @@ mod menubar {
     use std::cell::{OnceCell, RefCell};
     use std::sync::{Arc, Mutex, OnceLock};
 
-    use tracing::trace;
+    use tokio::sync::RwLock;
 
     // Store the sender globally so we can access it from the menu callbacks
     static SPEAKER_TX: OnceLock<Arc<Mutex<mpsc::UnboundedSender<SpeakerCommand>>>> =
@@ -434,7 +430,7 @@ mod menubar {
     static POLL_RX: OnceLock<Arc<Mutex<mpsc::UnboundedReceiver<SpeakerStatus>>>> = OnceLock::new();
 
     // Store speaker info once discovered
-    static SPEAKER_INFO: OnceLock<Arc<Mutex<Option<SpeakerInfo>>>> = OnceLock::new();
+    static SPEAKER_INFO: OnceLock<Arc<RwLock<SpeakerInfo>>> = OnceLock::new();
 
     // Ivars to store our app state
     #[derive(Debug)]
@@ -444,7 +440,6 @@ mod menubar {
         current_input: RefCell<Option<InputSource>>,
         power_item: OnceCell<Retained<NSMenuItem>>,
         speaker_powered: RefCell<bool>,
-        speaker_discovered: RefCell<bool>,
     }
 
     // Create our app delegate class
@@ -657,18 +652,6 @@ mod menubar {
             #[unsafe(method(processPollUpdates:))]
             fn process_poll_updates(&self, _timer: &NSTimer) {
 
-                if !*self.ivars().speaker_discovered.borrow() {
-                    if let Some(speaker_info) = SPEAKER_INFO.get() {
-                        if let Ok(info_lock) = speaker_info.try_lock() {
-                            if let Some(ref info) = *info_lock {
-                                *self.ivars().speaker_discovered.borrow_mut() = true;
-                                debug!("UI: Speaker discovered, enabling controls");
-                                trace!("UI: Full speaker info: {info:?}");
-                            }
-                        }
-                    }
-                }
-
                 if let Some(poll_rx) = POLL_RX.get() {
                     if let Ok(mut poll_rx) = poll_rx.try_lock() {
                         // Process all pending updates
@@ -712,11 +695,6 @@ mod menubar {
 
             #[unsafe(method(menuItemClicked:))]
             fn menu_item_clicked(&self, sender: &NSMenuItem) {
-                if !*self.ivars().speaker_discovered.borrow() {
-                    info!("Ignoring menu click - no speaker discovered yet");
-                    return;
-                }
-
                 let title = unsafe { sender.title() };
                 info!("Menu item clicked: {}", title);
 
@@ -752,11 +730,6 @@ mod menubar {
 
             #[unsafe(method(powerClicked:))]
             fn power_clicked(&self, _sender: &NSMenuItem) {
-                if !*self.ivars().speaker_discovered.borrow() {
-                    info!("Ignoring power click - no speaker discovered yet");
-                    return;
-                }
-
                 let is_powered = *self.ivars().speaker_powered.borrow();
                 info!("Power clicked - current state: {}", if is_powered { "on" } else { "off" });
 
@@ -822,7 +795,6 @@ mod menubar {
                 current_input: RefCell::new(None),
                 power_item: OnceCell::new(),
                 speaker_powered: RefCell::new(false),
-                speaker_discovered: RefCell::new(false),
             });
             unsafe { msg_send![super(this), init] }
         }
@@ -831,27 +803,13 @@ mod menubar {
     pub fn run(
         tx: mpsc::UnboundedSender<SpeakerCommand>,
         poll_rx: mpsc::UnboundedReceiver<SpeakerStatus>,
-        mut speaker_info_rx: mpsc::UnboundedReceiver<SpeakerInfo>,
+        speaker_info: Arc<RwLock<SpeakerInfo>>,
     ) {
         // Store the sender for use in menu callbacks - do this BEFORE creating the app delegate
         let _ = SPEAKER_TX.set(Arc::new(Mutex::new(tx)));
         let _ = POLL_RX.set(Arc::new(Mutex::new(poll_rx)));
-        let _ = SPEAKER_INFO.set(Arc::new(Mutex::new(None)));
 
-        // Start processing speaker info in background
-        std::thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            rt.block_on(async {
-                while let Some(info) = speaker_info_rx.recv().await {
-                    if let Some(speaker_info) = SPEAKER_INFO.get() {
-                        if let Ok(mut lock) = speaker_info.lock() {
-                            info!("Storing discovered speaker info: {:?}", info);
-                            *lock = Some(info);
-                        }
-                    }
-                }
-            });
-        });
+        let _ = SPEAKER_INFO.set(speaker_info);
 
         // This is required for GUI apps on macOS
         let mtm = MainThreadMarker::new().expect("Must be run on the main thread");
@@ -884,122 +842,95 @@ fn main() {
 
     info!("Starting qaf menubar app");
 
-    // Create channels for communication
-    let (tx, mut rx) = mpsc::unbounded_channel::<SpeakerCommand>();
+    // The macOS UI thread (main thread) gets the sender; the SpeakerController gets the receiver.
+    let (tx, rx) = mpsc::unbounded_channel::<SpeakerCommand>();
     let (poll_tx, poll_rx) = mpsc::unbounded_channel::<SpeakerStatus>();
-    let (speaker_info_tx, speaker_info_rx) = mpsc::unbounded_channel::<SpeakerInfo>();
 
-    let tx_discovery = tx.clone();
     let poll_tx_clone = poll_tx.clone();
+
+    let speaker_info = Arc::new(tokio::sync::RwLock::new(
+        speaker::SpeakerController::discover_speaker()
+            .expect("no speaker; do something better here"),
+    ));
+    let speaker_info2 = speaker_info.clone();
 
     // Spawn the async runtime in a separate thread
     std::thread::spawn(move || {
         let runtime = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
         runtime.block_on(async {
-            // Shared state for discovered speaker
-            let speaker_info = Arc::new(tokio::sync::RwLock::new(None::<SpeakerInfo>));
-
-            // Start speaker discovery
-            tokio::spawn(async move {
-                speaker::SpeakerController::discover_speakers(tx_discovery.clone()).await;
-            });
-
-            // Process discovery events and update shared state
-            let discovered_speaker_discovery = speaker_info.clone();
-            let (internal_tx, internal_rx) = mpsc::unbounded_channel::<SpeakerCommand>();
-            tokio::spawn(async move {
-                while let Some(cmd) = rx.recv().await {
-                    match &cmd {
-                        SpeakerCommand::SpeakerDiscovered(info) => {
-                            info!("Speaker discovered: {}", info.name);
-                            *discovered_speaker_discovery.write().await = Some(info.clone());
-                            let _ = speaker_info_tx.send(info.clone());
-                            let _ = internal_tx.send(cmd);
-                        }
-                        _ => {
-                            let _ = internal_tx.send(cmd);
-                        }
-                    }
-                }
-            });
-
             // Start periodic polling task
             tokio::spawn(async move {
                 let client = reqwest::Client::new();
-                let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(10));
+                let mut interval = tokio::time::interval(Duration::from_secs(30));
 
                 loop {
+                    // TODO: this re-implements the json API needlessly.
                     // Check if we have discovered a speaker
                     let speaker = speaker_info.read().await.clone();
-                    if let Some(speaker_info) = speaker {
-                        let base_url =
-                            format!("http://{}:{}", speaker_info.address, speaker_info.port);
+                    // Get speaker status
+                    let params = [
+                        ("path", "settings:/kef/host/speakerStatus"),
+                        ("roles", "value"),
+                    ];
 
-                        // Get speaker status
-                        let params = [
-                            ("path", "settings:/kef/host/speakerStatus"),
-                            ("roles", "value"),
-                        ];
+                    if let Ok(response) = client
+                        .get(&format!("{}/api/getData", speaker.base_url))
+                        .query(&params)
+                        .send()
+                        .await
+                    {
+                        if let Ok(power_json) = response.json::<serde_json::Value>().await {
+                            let power = power_json[0]["kefSpeakerStatus"]
+                                .as_str()
+                                .unwrap_or("unknown")
+                                .to_string();
 
-                        if let Ok(response) = client
-                            .get(&format!("{}/api/getData", base_url))
-                            .query(&params)
-                            .send()
-                            .await
-                        {
-                            if let Ok(power_json) = response.json::<serde_json::Value>().await {
-                                let power = power_json[0]["kefSpeakerStatus"]
-                                    .as_str()
-                                    .unwrap_or("unknown")
-                                    .to_string();
+                            let source = if power == "powerOn" {
+                                let params = [
+                                    ("path", "settings:/kef/play/physicalSource"),
+                                    ("roles", "value"),
+                                ];
 
-                                let source = if power == "powerOn" {
-                                    let params = [
-                                        ("path", "settings:/kef/play/physicalSource"),
-                                        ("roles", "value"),
-                                    ];
-
-                                    if let Ok(response) = client
-                                        .get(&format!("{}/api/getData", base_url))
-                                        .query(&params)
-                                        .send()
-                                        .await
+                                if let Ok(response) = client
+                                    .get(&format!("{}/api/getData", speaker.base_url))
+                                    .query(&params)
+                                    .send()
+                                    .await
+                                {
+                                    if let Ok(source_json) =
+                                        response.json::<serde_json::Value>().await
                                     {
-                                        if let Ok(source_json) =
-                                            response.json::<serde_json::Value>().await
-                                        {
-                                            let kef_source = source_json[0]["kefPhysicalSource"]
-                                                .as_str()
-                                                .unwrap_or("");
-                                            InputSource::from_kef_source(kef_source)
-                                        } else {
-                                            None
-                                        }
+                                        let kef_source = source_json[0]["kefPhysicalSource"]
+                                            .as_str()
+                                            .unwrap_or("");
+                                        InputSource::from_kef_source(kef_source)
                                     } else {
                                         None
                                     }
                                 } else {
                                     None
-                                };
+                                }
+                            } else {
+                                None
+                            };
 
-                                let status = SpeakerStatus {
-                                    power: power.clone(),
-                                    source,
-                                };
-                                debug!("Periodic poll: power={}, source={:?}", power, source);
-                                let _ = poll_tx_clone.send(status);
-                            }
+                            let status = SpeakerStatus {
+                                power: power.clone(),
+                                source,
+                            };
+                            debug!("Periodic poll: power={}, source={:?}", power, source);
+                            let _ = poll_tx_clone.send(status);
                         }
                     }
                     interval.tick().await;
                 }
             });
 
-            let controller = speaker::SpeakerController::new(internal_rx);
+            let controller = speaker::SpeakerController::new(rx);
             controller.run().await;
         });
     });
 
     // Run the UI on the main thread
-    menubar::run(tx, poll_rx, speaker_info_rx);
+    menubar::run(tx, poll_rx, speaker_info2);
 }
