@@ -1,7 +1,7 @@
 # Rust build artifacts
 /target/
 *.pdb
-
+codebook.toml
 # IDE and Editor files
 # VS Code
 .vscode/
