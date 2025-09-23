@@ -1,5 +1,7 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
+use std::sync::Arc;
+
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2::{DeclaredClass, MainThreadOnly, Message, define_class};
@@ -418,8 +420,11 @@ mod speaker {
 
 mod menubar {
     use super::*;
+
     use std::cell::{OnceCell, RefCell};
     use std::sync::{Arc, Mutex, OnceLock};
+
+    use tracing::trace;
 
     // Store the sender globally so we can access it from the menu callbacks
     static SPEAKER_TX: OnceLock<Arc<Mutex<mpsc::UnboundedSender<SpeakerCommand>>>> =
@@ -651,47 +656,14 @@ mod menubar {
         impl AppDelegate {
             #[unsafe(method(processPollUpdates:))]
             fn process_poll_updates(&self, _timer: &NSTimer) {
-                // Check for speaker discovery updates
-                if let Some(tx) = SPEAKER_TX.get() {
-                    if let Ok(tx) = tx.try_lock() {
-                        // Check if we have a discovered speaker
-                        if !*self.ivars().speaker_discovered.borrow() {
-                            if let Some(speaker_info) = SPEAKER_INFO.get() {
-                                if let Ok(info_lock) = speaker_info.try_lock() {
-                                    if let Some(ref info) = *info_lock {
-                                        *self.ivars().speaker_discovered.borrow_mut() = true;
-                                        info!("UI: Speaker discovered, enabling controls");
 
-                                        // Update UI to show speaker name
-                                        if let Some(status_item) = self.ivars().status_item.get() {
-                                            let title = NSString::from_str(&format!("KEF: {}", info.name));
-                                            unsafe {
-                                                if let Some(button) = status_item.button(MainThreadMarker::from(self)) {
-                                                    button.setTitle(&title);
-                                                }
-                                            }
-                                        }
-
-                                        // Now request initial status after a short delay
-                                        let tx_status = tx.clone();
-                                        std::thread::spawn(move || {
-                                            std::thread::sleep(std::time::Duration::from_millis(500));
-                                            let (status_tx, status_rx) = oneshot::channel();
-                                            let _ = tx_status.send(SpeakerCommand::GetStatus(status_tx));
-
-                                            // Try to get the status response
-                                            let rt = tokio::runtime::Runtime::new().unwrap();
-                                            if let Ok(Ok(status)) = rt.block_on(async {
-                                                tokio::time::timeout(
-                                                    tokio::time::Duration::from_secs(2),
-                                                    status_rx
-                                                ).await
-                                            }) {
-                                                info!("Got initial status after discovery: {:?}", status);
-                                            }
-                                        });
-                                    }
-                                }
+                if !*self.ivars().speaker_discovered.borrow() {
+                    if let Some(speaker_info) = SPEAKER_INFO.get() {
+                        if let Ok(info_lock) = speaker_info.try_lock() {
+                            if let Some(ref info) = *info_lock {
+                                *self.ivars().speaker_discovered.borrow_mut() = true;
+                                debug!("UI: Speaker discovered, enabling controls");
+                                trace!("UI: Full speaker info: {info:?}");
                             }
                         }
                     }
@@ -737,6 +709,7 @@ mod menubar {
                     }
                 }
             }
+
             #[unsafe(method(menuItemClicked:))]
             fn menu_item_clicked(&self, sender: &NSMenuItem) {
                 if !*self.ivars().speaker_discovered.borrow() {
@@ -860,16 +833,6 @@ mod menubar {
         poll_rx: mpsc::UnboundedReceiver<SpeakerStatus>,
         mut speaker_info_rx: mpsc::UnboundedReceiver<SpeakerInfo>,
     ) {
-        // Initialize tracing first
-        tracing_subscriber::fmt()
-            .with_env_filter(
-                tracing_subscriber::EnvFilter::from_default_env()
-                    .add_directive(tracing::Level::DEBUG.into()),
-            )
-            .init();
-
-        info!("Starting qaf menubar app");
-
         // Store the sender for use in menu callbacks - do this BEFORE creating the app delegate
         let _ = SPEAKER_TX.set(Arc::new(Mutex::new(tx)));
         let _ = POLL_RX.set(Arc::new(Mutex::new(poll_rx)));
@@ -912,35 +875,37 @@ mod menubar {
 }
 
 fn main() {
+    // Initialize tracing first
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::from_default_env(), // .add_directive(tracing::Level::DEBUG.into()),
+        )
+        .init();
+
+    info!("Starting qaf menubar app");
+
     // Create channels for communication
     let (tx, mut rx) = mpsc::unbounded_channel::<SpeakerCommand>();
     let (poll_tx, poll_rx) = mpsc::unbounded_channel::<SpeakerStatus>();
     let (speaker_info_tx, speaker_info_rx) = mpsc::unbounded_channel::<SpeakerInfo>();
 
-    let _tx_clone = tx.clone();
     let tx_discovery = tx.clone();
     let poll_tx_clone = poll_tx.clone();
-    let speaker_info_tx_clone = speaker_info_tx.clone();
 
     // Spawn the async runtime in a separate thread
     std::thread::spawn(move || {
         let runtime = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
         runtime.block_on(async {
             // Shared state for discovered speaker
-            let discovered_speaker =
-                std::sync::Arc::new(tokio::sync::RwLock::new(None::<SpeakerInfo>));
-            let _discovered_speaker_controller = discovered_speaker.clone();
-            let discovered_speaker_polling = discovered_speaker.clone();
+            let speaker_info = Arc::new(tokio::sync::RwLock::new(None::<SpeakerInfo>));
 
             // Start speaker discovery
-            let tx_discovery_task = tx_discovery.clone();
-            let speaker_info_tx_discovery = speaker_info_tx_clone.clone();
-            let discovered_speaker_discovery = discovered_speaker.clone();
             tokio::spawn(async move {
-                speaker::SpeakerController::discover_speakers(tx_discovery_task.clone()).await;
+                speaker::SpeakerController::discover_speakers(tx_discovery.clone()).await;
             });
 
             // Process discovery events and update shared state
+            let discovered_speaker_discovery = speaker_info.clone();
             let (internal_tx, internal_rx) = mpsc::unbounded_channel::<SpeakerCommand>();
             tokio::spawn(async move {
                 while let Some(cmd) = rx.recv().await {
@@ -948,7 +913,7 @@ fn main() {
                         SpeakerCommand::SpeakerDiscovered(info) => {
                             info!("Speaker discovered: {}", info.name);
                             *discovered_speaker_discovery.write().await = Some(info.clone());
-                            let _ = speaker_info_tx_discovery.send(info.clone());
+                            let _ = speaker_info_tx.send(info.clone());
                             let _ = internal_tx.send(cmd);
                         }
                         _ => {
@@ -961,13 +926,11 @@ fn main() {
             // Start periodic polling task
             tokio::spawn(async move {
                 let client = reqwest::Client::new();
-                let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
+                let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(10));
 
                 loop {
-                    interval.tick().await;
-
                     // Check if we have discovered a speaker
-                    let speaker = discovered_speaker_polling.read().await.clone();
+                    let speaker = speaker_info.read().await.clone();
                     if let Some(speaker_info) = speaker {
                         let base_url =
                             format!("http://{}:{}", speaker_info.address, speaker_info.port);
@@ -1023,11 +986,12 @@ fn main() {
                                     power: power.clone(),
                                     source,
                                 };
-                                info!("Periodic poll: power={}, source={:?}", power, source);
+                                debug!("Periodic poll: power={}, source={:?}", power, source);
                                 let _ = poll_tx_clone.send(status);
                             }
                         }
                     }
+                    interval.tick().await;
                 }
             });
 
