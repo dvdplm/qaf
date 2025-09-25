@@ -1,7 +1,7 @@
 use std::cell::{OnceCell, RefCell};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use crate::{InputSource, SpeakerCommand, SpeakerInfo, SpeakerStatus};
+use crate::{InputSource, SpeakerCommand, SpeakerStatus};
 
 use objc2::{
     DeclaredClass, MainThreadMarker, MainThreadOnly, Message, define_class, msg_send, rc::Retained,
@@ -13,14 +13,11 @@ use objc2_app_kit::{
 };
 use objc2_foundation::{NSObject, NSObjectProtocol, NSString, NSTimeInterval, NSTimer};
 use tokio::sync::mpsc::UnboundedReceiver;
-use tokio::sync::{RwLock, mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info};
 
 // Store the sender globally so we can access it from the menu callbacks
 static SPEAKER_TX: OnceLock<Arc<Mutex<mpsc::UnboundedSender<SpeakerCommand>>>> = OnceLock::new();
-
-// Store speaker info once discovered
-static SPEAKER_INFO: OnceLock<Arc<RwLock<SpeakerInfo>>> = OnceLock::new();
 
 // Ivars to store our app state
 #[derive(Debug)]
@@ -162,11 +159,28 @@ define_class!(
                 }
             }
 
+            let tv_item = unsafe {
+                NSMenuItem::initWithTitle_action_keyEquivalent(
+                    NSMenuItem::alloc(mtm),
+                    &NSString::from_str("Tv"),
+                    Some(objc2::sel!(menuItemClicked:)),
+                    &NSString::from_str(""),
+                )
+            };
+            unsafe {
+                tv_item.setTarget(Some(&self.retain()));
+                tv_item.setTag(5);
+                if current_input == Some(InputSource::Tv) {
+                    let _: () = msg_send![&tv_item, setState: 1i64];
+                }
+            }
+
             // Add items to menu
             menu.addItem(&usb_item);
             menu.addItem(&wifi_item);
             menu.addItem(&bluetooth_item);
             menu.addItem(&optical_item);
+            menu.addItem(&tv_item);
 
             // Add separator before power control
             let separator1 = NSMenuItem::separatorItem(mtm);
