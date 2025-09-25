@@ -3,6 +3,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use objc2_foundation::NSString;
+use objc2_foundation::ns_string;
 use tracing::{debug, info};
 
 // Channel for communication between UI and speaker controller
@@ -20,7 +22,7 @@ pub enum SpeakerCommand {
     PowerOn,
     PowerOff,
     PollUpdate(SpeakerStatus),
-    SpeakerDiscovered(SpeakerInfo),
+    // SpeakerDiscovered(SpeakerInfo),
 }
 
 #[derive(Debug, Clone)]
@@ -56,13 +58,17 @@ impl InputSource {
         }
     }
 
-    fn from_str(s: &str) -> Option<Self> {
-        match s {
-            "USB" => Some(InputSource::USB),
-            "WiFi" => Some(InputSource::WiFi),
-            "Bluetooth" => Some(InputSource::Bluetooth),
-            "Optical" => Some(InputSource::Optical),
-            _ => None,
+    fn from_ns_string(s: &NSString) -> Option<Self> {
+        if s == ns_string!("USB") {
+            Some(InputSource::USB)
+        } else if s == ns_string!("WiFi") {
+            Some(InputSource::WiFi)
+        } else if s == ns_string!("Bluetooth") {
+            Some(InputSource::Bluetooth)
+        } else if s == ns_string!("Optical") {
+            Some(InputSource::Optical)
+        } else {
+            None
         }
     }
 
@@ -80,24 +86,25 @@ impl InputSource {
 fn main() {
     // Initialize tracing first
     tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env(), // .add_directive(tracing::Level::DEBUG.into()),
-        )
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
     info!("Starting qaf menubar app");
 
     // The macOS UI thread (main thread) gets the sender; the SpeakerController gets the receiver.
+    // Used to communicate between the UI and the http API.
     let (tx, rx) = mpsc::unbounded_channel::<SpeakerCommand>();
+    // Speaker status polling task gets the sender. The macOS UI gets the receiver.
+    // Used to keep the UI in sync with the state of the speaker.
     let (poll_tx, poll_rx) = mpsc::unbounded_channel::<SpeakerStatus>();
 
-    let poll_tx_clone = poll_tx.clone();
-
-    let speaker_info = Arc::new(tokio::sync::RwLock::new(
+    let speaker_info = speaker::SpeakerController::discover_speaker()
+        .expect("no speaker; do something better here");
+    let speaker_info2 = Arc::new(tokio::sync::RwLock::new(
         speaker::SpeakerController::discover_speaker()
             .expect("no speaker; do something better here"),
     ));
-    let speaker_info2 = speaker_info.clone();
+    let controller = speaker::SpeakerController::new(speaker_info, rx);
 
     // Spawn the async runtime in a separate thread
     std::thread::spawn(move || {
@@ -111,7 +118,7 @@ fn main() {
                 loop {
                     // TODO: this re-implements the json API needlessly.
                     // Check if we have discovered a speaker
-                    let speaker = speaker_info.read().await.clone();
+                    let speaker = speaker_info2.read().await.clone();
                     // Get speaker status
                     let params = [
                         ("path", "settings:/kef/host/speakerStatus"),
@@ -164,18 +171,17 @@ fn main() {
                                 source,
                             };
                             debug!("Periodic poll: power={}, source={:?}", power, source);
-                            let _ = poll_tx_clone.send(status);
+                            let _ = poll_tx.send(status);
                         }
                     }
                     interval.tick().await;
                 }
             });
 
-            let controller = speaker::SpeakerController::new(rx);
             controller.run().await;
         });
     });
 
     // Run the UI on the main thread
-    menubar::run(tx, poll_rx, speaker_info2);
+    menubar::run(tx, poll_rx);
 }

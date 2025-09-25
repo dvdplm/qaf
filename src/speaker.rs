@@ -1,21 +1,23 @@
+use std::time::Duration;
+
 use crate::{InputSource, SpeakerCommand, SpeakerInfo, SpeakerStatus};
 
 use mdns_sd::{ServiceDaemon, ServiceEvent};
 use serde_json::json;
-use tokio::sync::mpsc;
+use tokio::{sync::mpsc, time::sleep};
 use tracing::{debug, error, info, trace, warn};
 
 pub struct SpeakerController {
     rx: mpsc::UnboundedReceiver<SpeakerCommand>,
-    base_url: Option<String>,
+    info: SpeakerInfo,
     client: reqwest::Client,
 }
 
 impl SpeakerController {
-    pub fn new(rx: mpsc::UnboundedReceiver<SpeakerCommand>) -> Self {
+    pub fn new(info: SpeakerInfo, rx: mpsc::UnboundedReceiver<SpeakerCommand>) -> Self {
         Self {
             rx,
-            base_url: None,
+            info,
             client: reqwest::Client::new(),
         }
     }
@@ -93,23 +95,12 @@ impl SpeakerController {
     }
 
     pub async fn run(mut self) {
-        info!("Speaker controller started, waiting for speaker discovery...");
+        debug!("Speaker controller started, waiting for speaker discovery...");
 
         while let Some(command) = self.rx.recv().await {
             match command {
-                SpeakerCommand::SpeakerDiscovered(info) => {
-                    info!(
-                        "Speaker discovered, updating base URL to http://{}:{}",
-                        info.address, info.port
-                    );
-                    self.base_url = Some(format!("http://{}:{}", info.address, info.port));
-                }
                 SpeakerCommand::SetInput(input) => {
-                    if self.base_url.is_none() {
-                        error!("Cannot set input: No speaker discovered yet");
-                        continue;
-                    }
-                    info!("Setting input to: {:?}", input);
+                    debug!("Setting input to: {:?}", input);
 
                     // First check if we need to power on
                     if let Ok(status) = self.get_speaker_status().await {
@@ -120,7 +111,7 @@ impl SpeakerController {
                                 continue;
                             }
                             // Wait a bit for the speaker to power on
-                            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                            sleep(Duration::from_millis(500)).await;
                         }
                     }
 
@@ -129,15 +120,7 @@ impl SpeakerController {
                     }
                 }
                 SpeakerCommand::GetStatus(tx) => {
-                    if self.base_url.is_none() {
-                        info!("Cannot get status: No speaker discovered yet");
-                        let _ = tx.send(SpeakerStatus {
-                            power: "unknown".to_string(),
-                            source: None,
-                        });
-                        continue;
-                    }
-                    info!("Getting speaker status");
+                    debug!("Getting speaker status");
                     match self.get_speaker_status().await {
                         Ok(status) => {
                             let _ = tx.send(status);
@@ -152,20 +135,12 @@ impl SpeakerController {
                     }
                 }
                 SpeakerCommand::PowerOn => {
-                    if self.base_url.is_none() {
-                        error!("Cannot power on: No speaker discovered yet");
-                        continue;
-                    }
                     info!("Powering on speakers");
                     if let Err(e) = self.power_on().await {
                         error!("Failed to power on: {}", e);
                     }
                 }
                 SpeakerCommand::PowerOff => {
-                    if self.base_url.is_none() {
-                        error!("Cannot power off: No speaker discovered yet");
-                        continue;
-                    }
                     info!("Powering off speakers");
                     if let Err(e) = self.power_off().await {
                         error!("Failed to power off: {}", e);
@@ -173,7 +148,7 @@ impl SpeakerController {
                 }
                 SpeakerCommand::PollUpdate(status) => {
                     // This is handled by the UI, just log it
-                    debug!("Poll update received: {:?}", status);
+                    trace!("Poll update received: {:?}", status);
                 }
             }
         }
@@ -182,7 +157,6 @@ impl SpeakerController {
     }
 
     async fn set_input(&self, input: InputSource) -> Result<(), Box<dyn std::error::Error>> {
-        let base_url = self.base_url.as_ref().ok_or("No speaker URL")?;
         let source = input.to_kef_source();
         let value = json!({
             "type": "kefPhysicalSource",
@@ -197,7 +171,7 @@ impl SpeakerController {
 
         let response = self
             .client
-            .get(&format!("{}/api/setData", base_url))
+            .get(&format!("{}/api/setData", self.info.base_url))
             .query(&params)
             .send()
             .await?;
@@ -213,7 +187,6 @@ impl SpeakerController {
     }
 
     async fn power_on(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let base_url = self.base_url.as_ref().ok_or("No speaker URL")?;
         let value = json!({
             "type": "kefPhysicalSource",
             "kefPhysicalSource": "powerOn"
@@ -227,7 +200,7 @@ impl SpeakerController {
 
         let response = self
             .client
-            .get(&format!("{}/api/setData", base_url))
+            .get(&format!("{}/api/setData", self.info.base_url))
             .query(&params)
             .send()
             .await?;
@@ -243,7 +216,6 @@ impl SpeakerController {
     }
 
     async fn power_off(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let base_url = self.base_url.as_ref().ok_or("No speaker URL")?;
         let value = json!({
             "type": "kefPhysicalSource",
             "kefPhysicalSource": "standby"
@@ -257,7 +229,7 @@ impl SpeakerController {
 
         let response = self
             .client
-            .get(&format!("{}/api/setData", base_url))
+            .get(&format!("{}/api/setData", self.info.base_url))
             .query(&params)
             .send()
             .await?;
@@ -273,7 +245,6 @@ impl SpeakerController {
     }
 
     async fn get_speaker_status(&self) -> Result<SpeakerStatus, Box<dyn std::error::Error>> {
-        let base_url = self.base_url.as_ref().ok_or("No speaker URL")?;
         // Get power status
         let params = [
             ("path", "settings:/kef/host/speakerStatus"),
@@ -282,7 +253,7 @@ impl SpeakerController {
 
         let response = self
             .client
-            .get(&format!("{}/api/getData", base_url))
+            .get(&format!("{}/api/getData", self.info.base_url))
             .query(&params)
             .send()
             .await?;
@@ -307,7 +278,7 @@ impl SpeakerController {
 
             let response = self
                 .client
-                .get(&format!("{}/api/getData", base_url))
+                .get(&format!("{}/api/getData", self.info.base_url))
                 .query(&params)
                 .send()
                 .await?;

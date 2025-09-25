@@ -12,14 +12,12 @@ use objc2_app_kit::{
     NSStatusBar, NSStatusItem,
 };
 use objc2_foundation::{NSObject, NSObjectProtocol, NSString, NSTimeInterval, NSTimer};
+use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::{RwLock, mpsc, oneshot};
 use tracing::{debug, info};
 
 // Store the sender globally so we can access it from the menu callbacks
 static SPEAKER_TX: OnceLock<Arc<Mutex<mpsc::UnboundedSender<SpeakerCommand>>>> = OnceLock::new();
-
-// Store a channel for receiving poll updates
-static POLL_RX: OnceLock<Arc<Mutex<mpsc::UnboundedReceiver<SpeakerStatus>>>> = OnceLock::new();
 
 // Store speaker info once discovered
 static SPEAKER_INFO: OnceLock<Arc<RwLock<SpeakerInfo>>> = OnceLock::new();
@@ -32,6 +30,7 @@ pub struct AppDelegateIvars {
     current_input: RefCell<Option<InputSource>>,
     power_item: OnceCell<Retained<NSMenuItem>>,
     speaker_powered: RefCell<bool>,
+    poll_rx: RefCell<UnboundedReceiver<SpeakerStatus>>,
 }
 
 // Create our app delegate class
@@ -243,39 +242,33 @@ define_class!(
     impl AppDelegate {
         #[unsafe(method(processPollUpdates:))]
         fn process_poll_updates(&self, _timer: &NSTimer) {
+            while let Ok(status) = self.ivars().poll_rx.borrow_mut().try_recv() {
+                debug!("Processing poll update: {:?}", status);
 
-            if let Some(poll_rx) = POLL_RX.get() {
-                if let Ok(mut poll_rx) = poll_rx.try_lock() {
-                    // Process all pending updates
-                    while let Ok(status) = poll_rx.try_recv() {
-                        debug!("Processing poll update: {:?}", status);
+                let is_powered = status.power == "powerOn";
+                *self.ivars().speaker_powered.borrow_mut() = is_powered;
+                *self.ivars().current_input.borrow_mut() = status.source;
 
-                        let is_powered = status.power == "powerOn";
-                        *self.ivars().speaker_powered.borrow_mut() = is_powered;
-                        *self.ivars().current_input.borrow_mut() = status.source;
+                // Update power menu item text
+                if let Some(power_item) = self.ivars().power_item.get() {
+                    let text = if is_powered { "Power Off" } else { "Power On" };
+                    unsafe {
+                        power_item.setTitle(&NSString::from_str(text));
+                    }
+                }
 
-                        // Update power menu item text
-                        if let Some(power_item) = self.ivars().power_item.get() {
-                            let text = if is_powered { "Power Off" } else { "Power On" };
-                            unsafe {
-                                power_item.setTitle(&NSString::from_str(text));
-                            }
-                        }
-
-                        // Update menu checkmarks
-                        if let Some(menu) = self.ivars().menu.get() {
-                            let item_count = unsafe { menu.numberOfItems() };
-                            for i in 0..item_count {
-                                if let Some(item) = unsafe { menu.itemAtIndex(i) } {
-                                    let title = unsafe { item.title().to_string() };
-                                    if let Some(input) = InputSource::from_str(&title) {
-                                        unsafe {
-                                            if status.source == Some(input) {
-                                                let _: () = msg_send![&item, setState: 1i64];
-                                            } else {
-                                                let _: () = msg_send![&item, setState: 0i64];
-                                            }
-                                        }
+                // Update menu checkmarks
+                if let Some(menu) = self.ivars().menu.get() {
+                    let item_count = unsafe { menu.numberOfItems() };
+                    for i in 0..item_count {
+                        if let Some(item) = unsafe { menu.itemAtIndex(i) } {
+                            let title = unsafe { item.title() };
+                            if let Some(input) = InputSource::from_ns_string(&title) {
+                                unsafe {
+                                    if status.source == Some(input) {
+                                        let _: () = msg_send![&item, setState: 1i64];
+                                    } else {
+                                        let _: () = msg_send![&item, setState: 0i64];
                                     }
                                 }
                             }
@@ -288,10 +281,10 @@ define_class!(
         #[unsafe(method(menuItemClicked:))]
         fn menu_item_clicked(&self, sender: &NSMenuItem) {
             let title = unsafe { sender.title() };
-            info!("Menu item clicked: {}", title);
+            debug!("Menu item clicked: {}", title);
 
             // Parse the input source
-            if let Some(input) = InputSource::from_str(&title.to_string()) {
+            if let Some(input) = InputSource::from_ns_string(&title) {
                 // Update the current input
                 *self.ivars().current_input.borrow_mut() = Some(input);
 
@@ -301,7 +294,7 @@ define_class!(
                     for i in 0..item_count {
                         if let Some(item) = unsafe { menu.itemAtIndex(i) } {
                             unsafe {
-                                if item.title().to_string() == title.to_string() {
+                                if item.title() == title {
                                     let _: () = msg_send![&item, setState: 1i64];
                                 } else {
                                     let _: () = msg_send![&item, setState: 0i64];
@@ -379,7 +372,10 @@ define_class!(
 );
 
 impl AppDelegate {
-    pub fn new(mtm: MainThreadMarker) -> Retained<Self> {
+    pub fn new(
+        mtm: MainThreadMarker,
+        poll_rx: mpsc::UnboundedReceiver<SpeakerStatus>,
+    ) -> Retained<Self> {
         let this = Self::alloc(mtm);
         let this = this.set_ivars(AppDelegateIvars {
             status_item: OnceCell::new(),
@@ -387,6 +383,7 @@ impl AppDelegate {
             current_input: RefCell::new(None),
             power_item: OnceCell::new(),
             speaker_powered: RefCell::new(false),
+            poll_rx: RefCell::new(poll_rx),
         });
         unsafe { msg_send![super(this), init] }
     }
@@ -395,13 +392,9 @@ impl AppDelegate {
 pub fn run(
     tx: mpsc::UnboundedSender<SpeakerCommand>,
     poll_rx: mpsc::UnboundedReceiver<SpeakerStatus>,
-    speaker_info: Arc<RwLock<SpeakerInfo>>,
 ) {
     // Store the sender for use in menu callbacks - do this BEFORE creating the app delegate
     let _ = SPEAKER_TX.set(Arc::new(Mutex::new(tx)));
-    let _ = POLL_RX.set(Arc::new(Mutex::new(poll_rx)));
-
-    let _ = SPEAKER_INFO.set(speaker_info);
 
     // This is required for GUI apps on macOS
     let mtm = MainThreadMarker::new().expect("Must be run on the main thread");
@@ -413,7 +406,7 @@ pub fn run(
     app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
 
     // Create and set our app delegate
-    let delegate = AppDelegate::new(mtm);
+    let delegate = AppDelegate::new(mtm, poll_rx);
 
     app.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
 
