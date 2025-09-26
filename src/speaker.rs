@@ -67,7 +67,7 @@ impl SpeakerController {
                         port,
                         name,
                         model,
-                        base_url: format!("http://{}:{}", addr.to_string(), port),
+                        base_url: format!("http://{}:{}", addr, port),
                     });
 
                     // Stop mDNS discovery by calling shutdown
@@ -77,7 +77,7 @@ impl SpeakerController {
                     match mdns.shutdown() {
                         Ok(shutdown_rx) => {
                             // Wait for shutdown confirmation
-                            if let Ok(_) = shutdown_rx.recv() {
+                            if shutdown_rx.recv().is_ok() {
                                 trace!("mDNS daemon shutdown successfully");
                             } else {
                                 warn!("Failed to receive mDNS shutdown confirmation");
@@ -91,7 +91,7 @@ impl SpeakerController {
                 }
             }
         }
-        return speaker_info;
+        speaker_info
     }
 
     pub async fn run(mut self) {
@@ -103,16 +103,16 @@ impl SpeakerController {
                     debug!("Setting input to: {:?}", input);
 
                     // First check if we need to power on
-                    if let Ok(status) = self.get_speaker_status().await {
-                        if status.power == "standby" {
-                            info!("Speaker is in standby, powering on first");
-                            if let Err(e) = self.power_on().await {
-                                error!("Failed to power on: {}", e);
-                                continue;
-                            }
-                            // Wait a bit for the speaker to power on
-                            sleep(Duration::from_millis(500)).await;
+                    if let Ok(status) = self.get_speaker_status().await
+                        && status.power == "standby"
+                    {
+                        debug!("Speaker is in standby, powering on first");
+                        if let Err(e) = self.power_on().await {
+                            error!("Failed to power on: {}", e);
+                            continue;
                         }
+                        // Wait a bit for the speaker to power on
+                        sleep(Duration::from_millis(500)).await;
                     }
 
                     if let Err(e) = self.set_input(input).await {
@@ -171,7 +171,7 @@ impl SpeakerController {
 
         let response = self
             .client
-            .get(&format!("{}/api/setData", self.info.base_url))
+            .get(format!("{}/api/setData", self.info.base_url))
             .query(&params)
             .send()
             .await?;
@@ -200,7 +200,7 @@ impl SpeakerController {
 
         let response = self
             .client
-            .get(&format!("{}/api/setData", self.info.base_url))
+            .get(format!("{}/api/setData", self.info.base_url))
             .query(&params)
             .send()
             .await?;
@@ -229,7 +229,7 @@ impl SpeakerController {
 
         let response = self
             .client
-            .get(&format!("{}/api/setData", self.info.base_url))
+            .get(format!("{}/api/setData", self.info.base_url))
             .query(&params)
             .send()
             .await?;
@@ -253,7 +253,7 @@ impl SpeakerController {
 
         let response = self
             .client
-            .get(&format!("{}/api/getData", self.info.base_url))
+            .get(format!("{}/api/getData", self.info.base_url))
             .query(&params)
             .send()
             .await?;
@@ -278,7 +278,7 @@ impl SpeakerController {
 
             let response = self
                 .client
-                .get(&format!("{}/api/getData", self.info.base_url))
+                .get(format!("{}/api/getData", self.info.base_url))
                 .query(&params)
                 .send()
                 .await?;

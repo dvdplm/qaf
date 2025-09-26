@@ -48,7 +48,7 @@ pub enum InputSource {
 }
 
 impl InputSource {
-    fn to_kef_source(&self) -> &'static str {
+    fn to_kef_source(self) -> &'static str {
         match self {
             InputSource::USB => "usb",
             InputSource::WiFi => "wifi",
