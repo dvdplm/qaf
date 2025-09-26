@@ -102,7 +102,7 @@ jobs:
           \`\`\`bash
           curl -L https://github.com/${{ github.repository }}/releases/download/${{ steps.get_version.outputs.version }}/qaf-${{ steps.get_version.outputs.version }}-apple-silicon.tar.gz | tar xz
           chmod +x qaf
-          sudo mv qaf /usr/local/bin/
+          qaf
           \`\`\`
 
           ### Checksum
