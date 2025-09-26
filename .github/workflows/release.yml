@@ -1,0 +1,126 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+      - "v*.*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release (e.g., v1.0.0)"
+        required: true
+        type: string
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-release:
+    name: Build Release Binary
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Get version
+        id: get_version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+          else
+            VERSION=${GITHUB_REF#refs/tags/}
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Building version: $VERSION"
+
+      - name: Build optimized binary
+        run: |
+          cargo build --release --target aarch64-apple-darwin
+          strip target/aarch64-apple-darwin/release/qaf
+
+      - name: Package binary
+        run: |
+          cd target/aarch64-apple-darwin/release
+          tar czf qaf-${{ steps.get_version.outputs.version }}-apple-silicon.tar.gz qaf
+          mv qaf-${{ steps.get_version.outputs.version }}-apple-silicon.tar.gz ../../../
+
+      - name: Create checksum
+        run: |
+          shasum -a 256 qaf-${{ steps.get_version.outputs.version }}-apple-silicon.tar.gz > checksums.txt
+          cat checksums.txt
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: release-artifacts
+          path: |
+            qaf-*.tar.gz
+            checksums.txt
+
+  create-release:
+    name: Create GitHub Release
+    needs: build-release
+    runs-on: macos-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Get version
+        id: get_version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+          else
+            VERSION=${GITHUB_REF#refs/tags/}
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Download release artifacts
+        uses: actions/download-artifact@v3
+        with:
+          name: release-artifacts
+          path: ./artifacts
+
+      - name: Generate release notes
+        id: release_notes
+        run: |
+          cat << EOF > release_notes.md
+          ## Installation
+
+          Download and extract the binary for Apple Silicon Macs:
+
+          \`\`\`bash
+          curl -L https://github.com/${{ github.repository }}/releases/download/${{ steps.get_version.outputs.version }}/qaf-${{ steps.get_version.outputs.version }}-apple-silicon.tar.gz | tar xz
+          chmod +x qaf
+          sudo mv qaf /usr/local/bin/
+          \`\`\`
+
+          ### Checksum
+          \`\`\`
+          $(cat artifacts/checksums.txt)
+          \`\`\`
+          EOF
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ steps.get_version.outputs.version }}
+          name: ${{ steps.get_version.outputs.version }}
+          body_path: release_notes.md
+          draft: false
+          prerelease: ${{ contains(steps.get_version.outputs.version, '-') }}
+          files: |
+            artifacts/qaf-*.tar.gz
+            artifacts/checksums.txt
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
