@@ -1,5 +1,4 @@
 use std::cell::{OnceCell, RefCell};
-use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::{InputSource, SpeakerCommand, SpeakerStatus};
 
@@ -16,9 +15,6 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info};
 
-// Store the sender globally so we can access it from the menu callbacks
-static SPEAKER_TX: OnceLock<Arc<Mutex<mpsc::UnboundedSender<SpeakerCommand>>>> = OnceLock::new();
-
 // Ivars to store our app state
 #[derive(Debug)]
 pub struct AppDelegateIvars {
@@ -28,6 +24,7 @@ pub struct AppDelegateIvars {
     power_item: OnceCell<Retained<NSMenuItem>>,
     speaker_powered: RefCell<bool>,
     poll_rx: RefCell<UnboundedReceiver<SpeakerStatus>>,
+    speaker_tx: RefCell<mpsc::UnboundedSender<SpeakerCommand>>,
 }
 
 // Create our app delegate class
@@ -45,7 +42,7 @@ define_class!(
     unsafe impl NSApplicationDelegate for AppDelegate {
         #[unsafe(method(applicationDidFinishLaunching:))]
         fn did_finish_launching(&self, _notification: &NSObject) {
-            info!("Application did finish launching");
+            debug!("Application did finish launching");
 
             let mtm = MainThreadMarker::from(self);
 
@@ -59,36 +56,30 @@ define_class!(
             let menu = NSMenu::new(mtm);
 
             // Query speaker status first
-            let current_input = if let Some(tx) = SPEAKER_TX.get() {
-                if let Ok(tx) = tx.lock() {
-                    let (status_tx, status_rx) = oneshot::channel();
-                    let _ = tx.send(SpeakerCommand::GetStatus(status_tx));
+            let current_input = {
+                let (status_tx, status_rx) = oneshot::channel();
+                let _ = self.ivars().speaker_tx.borrow().send(SpeakerCommand::GetStatus(status_tx));
 
-                    // Wait for response (with timeout)
-                    match std::thread::spawn(move || {
-                        let rt = tokio::runtime::Runtime::new().unwrap();
-                        rt.block_on(async {
-                            tokio::time::timeout(
-                                tokio::time::Duration::from_secs(2),
-                                status_rx
-                            ).await
-                        })
-                    }).join() {
-                        Ok(Ok(Ok(status))) => {
-                            info!("Speaker status on startup: {:?}", status);
-                            *self.ivars().speaker_powered.borrow_mut() = status.power == "powerOn";
-                            status.source
-                        }
-                        _ => {
-                            info!("Failed to get speaker status, defaulting to no selection");
-                            None
-                        }
+                // Wait for response (with timeout)
+                match std::thread::spawn(move || {
+                    let rt = tokio::runtime::Runtime::new().unwrap();
+                    rt.block_on(async {
+                        tokio::time::timeout(
+                            tokio::time::Duration::from_secs(2),
+                            status_rx
+                        ).await
+                    })
+                }).join() {
+                    Ok(Ok(Ok(status))) => {
+                        info!("Speaker status on startup: {:?}", status);
+                        *self.ivars().speaker_powered.borrow_mut() = status.power == "powerOn";
+                        status.source
                     }
-                } else {
-                    None
+                    _ => {
+                        info!("Failed to get speaker status, defaulting to no selection");
+                        None
+                    }
                 }
-            } else {
-                None
             };
 
             // Update the stored current input
@@ -319,11 +310,7 @@ define_class!(
                 }
 
                 // Send command to speaker controller
-                if let Some(tx) = SPEAKER_TX.get() {
-                    if let Ok(tx) = tx.lock() {
-                        let _ = tx.send(SpeakerCommand::SetInput(input));
-                    }
-                }
+                let _ = self.ivars().speaker_tx.borrow().send(SpeakerCommand::SetInput(input));
             }
         }
 
@@ -333,40 +320,36 @@ define_class!(
             info!("Power clicked - current state: {}", if is_powered { "on" } else { "off" });
 
             // Send appropriate command
-            if let Some(tx) = SPEAKER_TX.get() {
-                if let Ok(tx) = tx.lock() {
-                    if is_powered {
-                        let _ = tx.send(SpeakerCommand::PowerOff);
-                        *self.ivars().speaker_powered.borrow_mut() = false;
-                        *self.ivars().current_input.borrow_mut() = None;
-                    } else {
-                        let _ = tx.send(SpeakerCommand::PowerOn);
-                        *self.ivars().speaker_powered.borrow_mut() = true;
-                    }
+            if is_powered {
+                let _ = self.ivars().speaker_tx.borrow().send(SpeakerCommand::PowerOff);
+                *self.ivars().speaker_powered.borrow_mut() = false;
+                *self.ivars().current_input.borrow_mut() = None;
+            } else {
+                let _ = self.ivars().speaker_tx.borrow().send(SpeakerCommand::PowerOn);
+                *self.ivars().speaker_powered.borrow_mut() = true;
+            }
 
-                    // Update power menu item text
-                    if let Some(power_item) = self.ivars().power_item.get() {
-                        let new_text = if is_powered {
-                            "Power Off"
-                        } else {
-                            "Power On"
-                        };
-                        unsafe {
-                            power_item.setTitle(&NSString::from_str(new_text));
-                        }
-                    }
+            // Update power menu item text
+            if let Some(power_item) = self.ivars().power_item.get() {
+                let new_text = if is_powered {
+                    "Power Off"
+                } else {
+                    "Power On"
+                };
+                unsafe {
+                    power_item.setTitle(&NSString::from_str(new_text));
+                }
+            }
 
-                    // Clear selection if powering off
-                    if is_powered {
-                        // Clear all checkmarks
-                        if let Some(menu) = self.ivars().menu.get() {
-                            let item_count = unsafe { menu.numberOfItems() };
-                            for i in 0..item_count {
-                                if let Some(item) = unsafe { menu.itemAtIndex(i) } {
-                                    unsafe {
-                                        let _: () = msg_send![&item, setState: 0i64];
-                                    }
-                                }
+            // Clear selection if powering off
+            if is_powered {
+                // Clear all checkmarks
+                if let Some(menu) = self.ivars().menu.get() {
+                    let item_count = unsafe { menu.numberOfItems() };
+                    for i in 0..item_count {
+                        if let Some(item) = unsafe { menu.itemAtIndex(i) } {
+                            unsafe {
+                                let _: () = msg_send![&item, setState: 0i64];
                             }
                         }
                     }
@@ -388,6 +371,7 @@ define_class!(
 impl AppDelegate {
     pub fn new(
         mtm: MainThreadMarker,
+        speaker_tx: mpsc::UnboundedSender<SpeakerCommand>,
         poll_rx: mpsc::UnboundedReceiver<SpeakerStatus>,
     ) -> Retained<Self> {
         let this = Self::alloc(mtm);
@@ -398,6 +382,7 @@ impl AppDelegate {
             power_item: OnceCell::new(),
             speaker_powered: RefCell::new(false),
             poll_rx: RefCell::new(poll_rx),
+            speaker_tx: RefCell::new(speaker_tx),
         });
         unsafe { msg_send![super(this), init] }
     }
@@ -407,9 +392,6 @@ pub fn run(
     tx: mpsc::UnboundedSender<SpeakerCommand>,
     poll_rx: mpsc::UnboundedReceiver<SpeakerStatus>,
 ) {
-    // Store the sender for use in menu callbacks - do this BEFORE creating the app delegate
-    let _ = SPEAKER_TX.set(Arc::new(Mutex::new(tx)));
-
     // This is required for GUI apps on macOS
     let mtm = MainThreadMarker::new().expect("Must be run on the main thread");
 
@@ -420,7 +402,7 @@ pub fn run(
     app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
 
     // Create and set our app delegate
-    let delegate = AppDelegate::new(mtm, poll_rx);
+    let delegate = AppDelegate::new(mtm, tx, poll_rx);
 
     app.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
 

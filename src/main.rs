@@ -21,7 +21,6 @@ pub enum SpeakerCommand {
     PowerOn,
     PowerOff,
     PollUpdate(SpeakerStatus),
-    // SpeakerDiscovered(SpeakerInfo),
 }
 
 #[derive(Debug, Clone)]
