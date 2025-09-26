@@ -1,8 +1,5 @@
 # qaf
 
-![Build](https://github.com/aggron/qaf/workflows/Build/badge.svg)
-![Release](https://github.com/aggron/qaf/workflows/Release/badge.svg)
-
 A macOS menubar application for controlling KEF speakers via their network API.
 
 ## Features
